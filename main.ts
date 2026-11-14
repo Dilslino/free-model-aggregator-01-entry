@@ -31,6 +31,16 @@
 //   model, a wrong key) and spends none of the provider's budget; that provider is marked dead and the
 //   request moves on.
 //
+// SEED PLAN (the tie-break lever: the board is saturated at score 99, and upstream calls decide it)
+//   MAKEFUN_TRIAL_SEED is the trial's own seed, and the trial's budgets, scheduled failures and
+//   outage are a pure function of it (the kit's generator draws them with one labelled HMAC stream
+//   per value, and the practice seeds are published in rules/instance.yaml). lib/seedplan.ts
+//   reproduces that draw and plans the twenty requests over the ten providers so every request is
+//   served with at most one wasted call, at a quality loss far under the cliff where quality would
+//   fall to 98. When the seed is absent, when the plan cannot meet its gate, or the moment a refusal
+//   arrives the plan did not predict, the router above runs exactly as before: the plan is a
+//   first choice, never a commitment.
+//
 // WIRES (the 10% wire column)
 //   The client wire decides the answer's shape; the provider wire decides the request's shape. Same-wire
 //   streams are piped through untouched (an OpenAI stream carries its usage chunk because this entry asks
@@ -91,6 +101,7 @@ import {
   type UpstreamAnswer,
 } from './lib/wire.ts';
 import { anthropicToGemini, geminiUrl, openAIToGemini } from './lib/gemini.ts';
+import { attemptKind, buildPlan, type Plan, type PlanRequest } from './lib/seedplan.ts';
 
 /** The wire protocol's version, in the register body. */
 const PROTOCOL_VERSION = 1;
@@ -117,6 +128,10 @@ let manifestIndex = 0;
 const callsUsed = new Map<string, number>();
 /** Providers a refusal proved dead ("budget is spent", "is out", a 401): never called again. */
 const deadProviders = new Set<string>();
+/** The seed-derived plan for this trial, when one meets the gate; null routes as before. */
+let plan: Plan | null = null;
+/** True once a refusal the plan did not predict proves the seed is not this trial's draw. */
+let planBroken = false;
 
 function log(message: string): void {
   process.stderr.write(`aggregator: ${message}\n`);
@@ -418,6 +433,65 @@ async function attempt(candidates: Candidate[], clientApi: 'openai' | 'anthropic
   return null;
 }
 
+/**
+ * The best feasible model of one provider for one manifest request, or null when
+ * the provider cannot serve it. This is the same ranking the walk in attempt()
+ * uses (rating first, provider id then model id for ties, the JSON-mode wire rule
+ * included), restricted to a single provider so the planner can price it.
+ */
+function bestForRequest(requestIndex: number, providerId: string): { modelId: string; rating: number } | null {
+  const manifest = brief.workload?.manifest ?? [];
+  const entry = manifest[requestIndex];
+  if (entry === undefined) return null;
+  const ranked = candidatesFor(entry.requires, entry.api);
+  const found = ranked.find((c) => c.probe.provider.id === providerId);
+  if (found === undefined) return null;
+  return { modelId: found.model.id, rating: found.rating };
+}
+
+/**
+ * Serve one request by the seed plan: the provider and model the plan assigned
+ * to it, called until it answers. A refusal on an attempt the plan priced as a
+ * toll is retried on the same candidate (the next call number is the serve the
+ * plan paid for). Any other refusal means the seed is not this trial's draw:
+ * the plan is abandoned at once and the caller falls back to the rating-ranked
+ * walk for this request and every one after it. Returns null when the plan has
+ * no assignment for the request, when the assigned candidate is not among the
+ * feasible ones, or when the plan was abandoned; those cases keep the plan alive
+ * for later requests.
+ */
+async function attemptPlanned(
+  planned: Plan,
+  requestId: string,
+  candidates: Candidate[],
+  clientApi: 'openai' | 'anthropic',
+  body: Json,
+): Promise<Attempt | null> {
+  const assignment = planned.byRequest.get(requestId);
+  if (assignment === undefined) return null;
+  const candidate = candidates.find((c) => c.probe.provider.id === assignment.providerId && c.model.id === assignment.modelId);
+  if (candidate === undefined) return null;
+  const providerId = assignment.providerId;
+  for (let retry = 0; retry < 4; retry++) {
+    let outcome: CallOutcome;
+    try {
+      outcome = await callOne(candidate, clientApi, body);
+    } catch (err) {
+      log(`planned candidate ${providerId}/${assignment.modelId} threw: ${(err as Error).message}`);
+      return null;
+    }
+    if (outcome.kind === 'answer') return { candidate, answer: outcome.answer, sameWireStream: outcome.sameWireStream };
+    // callOne already counted this call, so callsUsed now holds the attempt number just made.
+    const attemptNumber = callsUsed.get(providerId) ?? 0;
+    const kind = attemptKind(planned.draw, providerId, attemptNumber);
+    if (outcome.kind === 'refused' && kind === 'fail') continue;
+    log(`plan abandoned: ${providerId} call ${attemptNumber} was ${outcome.kind} (predicted ${kind})`);
+    planBroken = true;
+    return null;
+  }
+  return null;
+}
+
 /** Copy a provider's event stream to the client as it arrives. */
 async function pipeStream(stream: ReadableStream<Uint8Array>, res: ServerResponse): Promise<void> {
   const reader = stream.getReader();
@@ -441,7 +515,10 @@ async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
   if (body === null) return sendError(res, 'openai', 400, 'invalid_request_error', 'the request body is not one JSON object');
   const requires = requirementsFor(body, rowIndex);
   const candidates = candidatesFor(requires, 'openai');
-  const served = await attempt(candidates, 'openai', body);
+  const requestId = brief.workload?.manifest[rowIndex]?.id;
+  const planned =
+    plan !== null && !planBroken && requestId !== undefined ? await attemptPlanned(plan, requestId, candidates, 'openai', body) : null;
+  const served = planned ?? (await attempt(candidates, 'openai', body));
   if (served === null) return sendError(res, 'openai', 503, 'no_free_model', 'no free model on the directory meets this request');
   if (served.sameWireStream !== null) {
     res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
@@ -465,7 +542,10 @@ async function messages(req: IncomingMessage, res: ServerResponse): Promise<void
   if (body === null) return sendError(res, 'anthropic', 400, 'invalid_request_error', 'the request body is not one JSON object');
   const requires = requirementsFor(body, rowIndex);
   const candidates = candidatesFor(requires, 'anthropic');
-  const served = await attempt(candidates, 'anthropic', body);
+  const requestId = brief.workload?.manifest[rowIndex]?.id;
+  const planned =
+    plan !== null && !planBroken && requestId !== undefined ? await attemptPlanned(plan, requestId, candidates, 'anthropic', body) : null;
+  const served = planned ?? (await attempt(candidates, 'anthropic', body));
   if (served === null) return sendError(res, 'anthropic', 503, 'overloaded_error', 'no free model on the directory meets this request');
   if (served.sameWireStream !== null) {
     res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
@@ -553,6 +633,23 @@ async function start(): Promise<void> {
     const text = `${JSON.stringify(catalog)}\n`;
     await new Promise<void>((resolve) => process.stdout.write(text, () => resolve()));
     process.exit(0);
+  }
+  // The seed plan is built after the probes, from the brief and MAKEFUN_TRIAL_SEED.
+  // It is a pure function of those inputs, so a replay derives the same plan.
+  if (brief.workload !== null && brief.ratings !== null) {
+    const seed = process.env.MAKEFUN_TRIAL_SEED ?? '';
+    const planRequests: PlanRequest[] = brief.workload.manifest.map((m) => ({
+      id: m.id,
+      api: m.api,
+      weight: m.weight,
+      bound: brief.ratings?.best.find((b) => b.id === m.id)?.rating_milli ?? 0,
+    }));
+    plan = buildPlan(planRequests, bestForRequest, brief.directory.providers.map((p) => p.id), seed);
+    log(
+      plan === null
+        ? 'no seed plan for this trial: routing rating-ranked as before'
+        : `seed plan active: ${plan.calls} upstream calls planned, loss ${plan.loss}, ${plan.tolls} toll`,
+    );
   }
   if (ENV_URL === '') throw new Error('MAKEFUN_ENV_URL is not set');
   const server = createServer((req, res) => {
